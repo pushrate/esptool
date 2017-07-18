@@ -1034,7 +1034,9 @@ class ImageSegment(object):
     def copy_with_new_addr(self, new_addr):
         """ Return a new ImageSegment with same data, but mapped at
         a new address. """
-        return ImageSegment(new_addr, self.data, 0)
+        cpy = ImageSegment(new_addr, self.data, 0)
+        cpy.include_in_checksum = self.include_in_checksum
+        return cpy
 
     def __repr__(self):
         r = "len 0x%05x load 0x%08x" % (len(self.data), self.addr)
@@ -1185,7 +1187,7 @@ class OTAFirmwareImage(BaseFirmwareImage):
 
     ROM_LOADER = ESP8266ROM
 
-    def __init__(self, load_file=None):
+    def __init__(self, load_file=None, checksum_irom=False):
         super(OTAFirmwareImage, self).__init__()
         self.version = 2
         if load_file is not None:
@@ -1201,7 +1203,7 @@ class OTAFirmwareImage(BaseFirmwareImage):
             irom_segment = self.load_segment(load_file, True)
             # for actual mapped addr, add ESP8266ROM.IROM_MAP_START + flashing_Addr + 8
             irom_segment.addr = 0
-            irom_segment.include_in_checksum = False
+            irom_segment.include_in_checksum = checksum_irom
 
             first_flash_mode = self.flash_mode
             first_flash_size_freq = self.flash_size_freq
@@ -1225,6 +1227,16 @@ class OTAFirmwareImage(BaseFirmwareImage):
                 self.load_segment(load_file)
             self.checksum = self.read_checksum(load_file)
 
+    def calculate_checksum(self, **kwargs):
+        """ Calculate checksum of loaded image, based on segments in
+        segment array.
+        """
+        checksum = ESPLoader.ESP_CHECKSUM_MAGIC
+        for seg in self.segments:
+            if seg.include_in_checksum or kwargs["checksum_irom"]:
+                checksum = ESPLoader.checksum(seg.data, checksum)
+        return checksum
+
     def default_output_name(self, input_file):
         """ Derive a default output name from the ELF name. """
         irom_segment = self.get_irom_segment()
@@ -1241,16 +1253,20 @@ class OTAFirmwareImage(BaseFirmwareImage):
             f.write(struct.pack(b'<BBBBI', ESPBOOTLOADER.IMAGE_V2_MAGIC, ESPBOOTLOADER.IMAGE_V2_SEGMENT,
                                 self.flash_mode, self.flash_size_freq, self.entrypoint))
 
+
+            checksum = ESPLoader.ESP_CHECKSUM_MAGIC
             irom_segment = self.get_irom_segment()
             if irom_segment is not None:
                 # save irom0 segment, make sure it has load addr 0 in the file
                 irom_segment = irom_segment.copy_with_new_addr(0)
-                self.save_segment(f, irom_segment)
+                if irom_segment.include_in_checksum:
+                    checksum = self.save_segment(f, irom_segment, checksum)
+                else:
+                    self.save_segment(f, irom_segment)
 
             # second header, matches V1 header and contains loadable segments
             normal_segments = self.get_non_irom_segments()
             self.write_common_header(f, normal_segments)
-            checksum = ESPLoader.ESP_CHECKSUM_MAGIC
             for segment in normal_segments:
                 checksum = self.save_segment(f, segment, checksum)
             self.append_checksum(f, checksum)
@@ -1758,7 +1774,12 @@ def image_info(args):
     for seg in image.segments:
         idx += 1
         print('Segment %d: %r' % (idx, seg))
-    calc_checksum = image.calculate_checksum()
+
+    if isinstance(image, OTAFirmwareImage):
+        calc_checksum = image.calculate_checksum(checksum_irom=args.checksum_irom)
+    else:
+        calc_checksum = image.calculate_checksum()
+
     print('Checksum: %02x (%s)' % (image.checksum,
                                    'valid' if image.checksum == calc_checksum else 'invalid - calculated %02x' % calc_checksum))
 
@@ -1787,7 +1808,7 @@ def elf2image(args):
     elif args.version == '1':  # ESP8266
         image = ESPFirmwareImage()
     else:
-        image = OTAFirmwareImage()
+        image = OTAFirmwareImage(checksum_irom=args.checksum_irom)
     image.entrypoint = e.entrypoint
     image.segments = e.sections  # ELFSection is a subclass of ImageSegment
     image.flash_mode = {'qio':0, 'qout':1, 'dio':2, 'dout': 3}[args.flash_mode]
@@ -1796,6 +1817,7 @@ def elf2image(args):
 
     if args.output is None:
         args.output = image.default_output_name(args.input)
+
     image.save(args.output)
 
 
@@ -2023,6 +2045,8 @@ def main():
         'image_info',
         help='Dump headers from an application image')
     parser_image_info.add_argument('filename', help='Image file to parse')
+    parser_image_info.add_argument('--checksum-irom', '-cs', help='Add checksum to IROM segment',
+                                   action="store_true")
 
     parser_make_image = subparsers.add_parser(
         'make_image',
@@ -2036,6 +2060,8 @@ def main():
         'elf2image',
         help='Create an application image from ELF file')
     parser_elf2image.add_argument('input', help='Input ELF file')
+    parser_elf2image.add_argument('--checksum-irom', '-cs', help='Add checksum to IROM segment',
+                                  action="store_true")
     parser_elf2image.add_argument('--output', '-o', help='Output filename prefix (for version 1 image), or filename (for version 2 single image)', type=str)
     parser_elf2image.add_argument('--version', '-e', help='Output image version', choices=['1','2'], default='1')
 
